@@ -17,5 +17,10 @@
   "bugs": {
     "url": "https://github.com/abrar-hossain20/just-mart-backend/issues"
   },
-  "homepage": "https://github.com/abrar-hossain20/just-mart-backend#readme"
+  "homepage": "https://github.com/abrar-hossain20/just-mart-backend#readme",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "mongodb": "^7.0.0"
+  }
 }
