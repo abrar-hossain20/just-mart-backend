@@ -85,6 +85,37 @@ async function run() {
       }
     });
 
+    // Update product by ID
+    app.put("/api/products/:id", async (req, res) => {
+      try {
+        const productId = req.params.id;
+        const updateData = { ...req.body };
+
+        // Remove fields that shouldn't be updated
+        delete updateData._id;
+        delete updateData.datePosted;
+        delete updateData.rating;
+
+        const result = await productsCollection.updateOne(
+          { _id: new ObjectId(productId) },
+          { $set: updateData },
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ message: "Product not found" });
+        }
+
+        res.json({
+          message: "Product updated successfully",
+          modifiedCount: result.modifiedCount,
+        });
+      } catch (error) {
+        res
+          .status(500)
+          .json({ message: "Error updating product", error: error.message });
+      }
+    });
+
     // ===================== CATEGORIES ROUTES =====================
 
     // Get all categories
