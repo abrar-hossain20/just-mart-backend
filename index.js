@@ -116,6 +116,92 @@ async function run() {
       }
     });
 
+    // ===================== ORDERS ROUTES =====================
+
+    // Get user's orders (as buyer)
+    app.get("/api/orders/:email", async (req, res) => {
+      try {
+        const orders = await ordersCollection
+          .find({ buyerEmail: req.params.email })
+          .sort({ orderDate: -1 })
+          .toArray();
+        res.json(orders);
+      } catch (error) {
+        res
+          .status(500)
+          .json({ message: "Error fetching orders", error: error.message });
+      }
+    });
+
+    // Get orders received (as seller)
+    app.get("/api/orders/received/:email", async (req, res) => {
+      try {
+        const orders = await ordersCollection
+          .find({ "items.sellerEmail": req.params.email })
+          .sort({ orderDate: -1 })
+          .toArray();
+        res.json(orders);
+      } catch (error) {
+        res.status(500).json({
+          message: "Error fetching received orders",
+          error: error.message,
+        });
+      }
+    });
+
+    // Create new order
+    app.post("/api/orders", async (req, res) => {
+      try {
+        const orderData = {
+          ...req.body,
+          orderDate: new Date(),
+          status: "Pending",
+          paymentStatus: "Pending",
+        };
+
+        const result = await ordersCollection.insertOne(orderData);
+
+        // Clear buyer's cart after order
+        if (orderData.buyerEmail) {
+          await cartsCollection.updateOne(
+            { userEmail: orderData.buyerEmail },
+            { $set: { items: [] } },
+          );
+        }
+
+        res.status(201).json({
+          message: "Order placed successfully",
+          orderId: result.insertedId,
+        });
+      } catch (error) {
+        res
+          .status(500)
+          .json({ message: "Error creating order", error: error.message });
+      }
+    });
+
+    // Update order status
+    app.patch("/api/orders/:id/status", async (req, res) => {
+      try {
+        const { status } = req.body;
+        const result = await ordersCollection.updateOne(
+          { _id: new ObjectId(req.params.id) },
+          { $set: { status, updatedAt: new Date() } },
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ message: "Order not found" });
+        }
+
+        res.json({ message: "Order status updated successfully" });
+      } catch (error) {
+        res.status(500).json({
+          message: "Error updating order status",
+          error: error.message,
+        });
+      }
+    });
+
     // ===================== CATEGORIES ROUTES =====================
 
     // Get all categories
