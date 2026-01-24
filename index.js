@@ -70,7 +70,6 @@ async function run() {
         const productData = {
           ...req.body,
           datePosted: new Date().toISOString(),
-          views: 0,
           rating: 0,
         };
 
@@ -83,6 +82,28 @@ async function run() {
         res
           .status(500)
           .json({ message: "Error creating product", error: error.message });
+      }
+    });
+
+    // ===================== CATEGORIES ROUTES =====================
+
+    // Get all categories
+    app.get("/api/categories", async (req, res) => {
+      try {
+        const categories = [
+          { id: 1, name: "Books & Notes" },
+          { id: 2, name: "Electronics" },
+          { id: 3, name: "Furniture" },
+          { id: 4, name: "Fashion" },
+          { id: 5, name: "Sports & Fitness" },
+          { id: 6, name: "Vehicles" },
+          { id: 7, name: "Others" },
+        ];
+        res.json(categories);
+      } catch (error) {
+        res
+          .status(500)
+          .json({ message: "Error fetching categories", error: error.message });
       }
     });
 
