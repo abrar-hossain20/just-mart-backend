@@ -121,16 +121,27 @@ async function run() {
     // Get all categories
     app.get("/api/categories", async (req, res) => {
       try {
-        const categories = [
-          { id: 1, name: "Books & Notes" },
-          { id: 2, name: "Electronics" },
-          { id: 3, name: "Furniture" },
-          { id: 4, name: "Fashion" },
-          { id: 5, name: "Sports & Fitness" },
-          { id: 6, name: "Vehicles" },
-          { id: 7, name: "Others" },
+        const categoryNames = [
+          "Books & Notes",
+          "Electronics",
+          "Furniture",
+          "Fashion",
+          "Sports & Fitness",
+          "Vehicles",
+          "Others",
         ];
-        res.json(categories);
+
+        // Get product count for each category
+        const categoriesWithCount = await Promise.all(
+          categoryNames.map(async (name, index) => {
+            const count = await productsCollection.countDocuments({
+              category: name,
+            });
+            return { id: index + 1, name, count };
+          }),
+        );
+
+        res.json(categoriesWithCount);
       } catch (error) {
         res
           .status(500)
