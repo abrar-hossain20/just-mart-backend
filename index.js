@@ -474,17 +474,147 @@ async function run() {
 
     // ===================== ORDERS ROUTES =====================
 
-    // Get user's orders
+    // Get user's orders (as buyer)
     app.get("/api/orders/:email", async (req, res) => {
       try {
         const orders = await ordersCollection
-          .find({ userEmail: req.params.email })
+          .find({
+            $or: [
+              { userEmail: req.params.email },
+              { buyerEmail: req.params.email },
+            ],
+          })
           .toArray();
         res.json(orders);
       } catch (error) {
         res
           .status(500)
           .json({ message: "Error fetching orders", error: error.message });
+      }
+    });
+
+    // Get orders received by seller
+    app.get("/api/orders/received/:email", async (req, res) => {
+      try {
+        const orders = await ordersCollection
+          .find({ sellerEmail: req.params.email })
+          .toArray();
+        res.json(orders);
+      } catch (error) {
+        res.status(500).json({
+          message: "Error fetching seller orders",
+          error: error.message,
+        });
+      }
+    });
+
+    // Update order status (with stock reduction for Processing/Shipped)
+    app.patch("/api/orders/:id/status", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { status } = req.body;
+
+        // Get the order first
+        const order = await ordersCollection.findOne({ _id: new ObjectId(id) });
+        if (!order) {
+          return res.status(404).json({ message: "Order not found" });
+        }
+
+        // If changing to Processing or Shipped, reduce stock
+        if (
+          (status === "Processing" || status === "Shipped") &&
+          order.status !== "Processing" &&
+          order.status !== "Shipped"
+        ) {
+          // Reduce stock for each item in the order
+          for (const item of order.items) {
+            await productsCollection.updateOne(
+              { _id: new ObjectId(item.productId) },
+              { $inc: { stock: -item.quantity } },
+            );
+          }
+        }
+
+        // Update the order status
+        const result = await ordersCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              status: status,
+              updatedAt: new Date(),
+            },
+          },
+        );
+
+        if (result.modifiedCount === 0) {
+          return res
+            .status(404)
+            .json({ message: "Order not found or no changes made" });
+        }
+
+        res.json({ message: "Order status updated successfully", status });
+      } catch (error) {
+        res.status(500).json({
+          message: "Error updating order status",
+          error: error.message,
+        });
+      }
+    });
+
+    // Cancel order (buyer)
+    app.patch("/api/orders/:id/cancel", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { userEmail } = req.body;
+
+        // Get the order first
+        const order = await ordersCollection.findOne({ _id: new ObjectId(id) });
+        if (!order) {
+          return res.status(404).json({ message: "Order not found" });
+        }
+
+        // Check if the user is the buyer (check both userEmail and buyerEmail for compatibility)
+        const orderBuyerEmail = order.userEmail || order.buyerEmail;
+        if (orderBuyerEmail !== userEmail) {
+          return res
+            .status(403)
+            .json({ message: "Unauthorized to cancel this order" });
+        }
+
+        // Only allow cancellation if order is not Delivered
+        if (order.status === "Delivered") {
+          return res
+            .status(400)
+            .json({ message: "Cannot cancel delivered orders" });
+        }
+
+        // If order was Processing or Shipped, restore the stock
+        if (order.status === "Processing" || order.status === "Shipped") {
+          for (const item of order.items) {
+            await productsCollection.updateOne(
+              { _id: new ObjectId(item.productId) },
+              { $inc: { stock: item.quantity } },
+            );
+          }
+        }
+
+        // Update the order status to Cancelled
+        const result = await ordersCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              status: "Cancelled",
+              cancelledAt: new Date(),
+              updatedAt: new Date(),
+            },
+          },
+        );
+
+        res.json({ message: "Order cancelled successfully" });
+      } catch (error) {
+        res
+          .status(500)
+          .json({ message: "Error cancelling order", error: error.message });
       }
     });
 
