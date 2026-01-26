@@ -289,10 +289,26 @@ async function run() {
     // Get user profile
     app.get("/api/users/:email/profile", async (req, res) => {
       try {
-        const user = await usersCollection.findOne({ email: req.params.email });
+        let user = await usersCollection.findOne({ email: req.params.email });
+
+        // If user doesn't exist, create them with default profile
         if (!user) {
-          return res.status(404).json({ message: "User not found" });
+          const newUser = {
+            email: req.params.email,
+            profile: {
+              buyingContactNumber: "",
+              sellingContactNumber: "",
+              address: {
+                locationType: "Inside Campus",
+                customAddress: "",
+              },
+            },
+            createdAt: new Date(),
+          };
+          await usersCollection.insertOne(newUser);
+          user = newUser;
         }
+
         res.json({
           profile: user.profile || {
             buyingContactNumber: "",
@@ -330,12 +346,15 @@ async function run() {
               },
               updatedAt: new Date(),
             },
+            $setOnInsert: {
+              email: req.params.email,
+              createdAt: new Date(),
+            },
           },
+          { upsert: true },
         );
 
-        if (result.matchedCount === 0) {
-          return res.status(404).json({ message: "User not found" });
-        }
+        res.json({ message: "Profile updated successfully" });
 
         res.json({ message: "Profile updated successfully" });
       } catch (error) {
