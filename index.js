@@ -284,6 +284,67 @@ async function run() {
       }
     });
 
+    // ===================== PROFILE ROUTES =====================
+
+    // Get user profile
+    app.get("/api/users/:email/profile", async (req, res) => {
+      try {
+        const user = await usersCollection.findOne({ email: req.params.email });
+        if (!user) {
+          return res.status(404).json({ message: "User not found" });
+        }
+        res.json({
+          profile: user.profile || {
+            buyingContactNumber: "",
+            sellingContactNumber: "",
+            address: {
+              locationType: "Inside Campus",
+              customAddress: "",
+            },
+          },
+        });
+      } catch (error) {
+        res
+          .status(500)
+          .json({ message: "Error fetching profile", error: error.message });
+      }
+    });
+
+    // Update user profile
+    app.put("/api/users/:email/profile", async (req, res) => {
+      try {
+        const { profile } = req.body;
+
+        const result = await usersCollection.updateOne(
+          { email: req.params.email },
+          {
+            $set: {
+              profile: {
+                buyingContactNumber: profile.buyingContactNumber || "",
+                sellingContactNumber: profile.sellingContactNumber || "",
+                address: {
+                  locationType:
+                    profile.address?.locationType || "Inside Campus",
+                  customAddress: profile.address?.customAddress || "",
+                },
+              },
+              updatedAt: new Date(),
+            },
+          },
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ message: "User not found" });
+        }
+
+        res.json({ message: "Profile updated successfully" });
+      } catch (error) {
+        res
+          .status(500)
+          .json({ message: "Error updating profile", error: error.message });
+      }
+    });
+
     // ===================== CART ROUTES =====================
 
     // Get user's cart
