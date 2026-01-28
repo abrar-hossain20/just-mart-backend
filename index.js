@@ -32,6 +32,7 @@ async function run() {
     const cartsCollection = db.collection("carts");
     const wishlistsCollection = db.collection("wishlists");
     const ordersCollection = db.collection("orders");
+    const ratingsCollection = db.collection("ratings");
 
     // ===================== PRODUCTS ROUTES =====================
 
@@ -71,6 +72,7 @@ async function run() {
           ...req.body,
           datePosted: new Date().toISOString(),
           rating: 0,
+          totalRatings: 0,
         };
 
         const result = await productsCollection.insertOne(productData);
@@ -95,6 +97,7 @@ async function run() {
         delete updateData._id;
         delete updateData.datePosted;
         delete updateData.rating;
+        delete updateData.totalRatings;
 
         const result = await productsCollection.updateOne(
           { _id: new ObjectId(productId) },
@@ -159,6 +162,16 @@ async function run() {
           paymentStatus: "Pending",
         };
 
+        // Decrement stock for each product in the order
+        if (orderData.items && orderData.items.length > 0) {
+          for (const item of orderData.items) {
+            await productsCollection.updateOne(
+              { _id: new ObjectId(item.productId) },
+              { $inc: { stock: -item.quantity } },
+            );
+          }
+        }
+
         const result = await ordersCollection.insertOne(orderData);
 
         // Clear buyer's cart after order
@@ -197,6 +210,187 @@ async function run() {
       } catch (error) {
         res.status(500).json({
           message: "Error updating order status",
+          error: error.message,
+        });
+      }
+    });
+
+    // Cancel order
+    app.patch("/api/orders/:id/cancel", async (req, res) => {
+      try {
+        const { userEmail } = req.body;
+        const order = await ordersCollection.findOne({
+          _id: new ObjectId(req.params.id),
+        });
+
+        if (!order) {
+          return res.status(404).json({ message: "Order not found" });
+        }
+
+        // Check if user is the buyer
+        if (order.buyerEmail !== userEmail) {
+          return res
+            .status(403)
+            .json({ message: "Unauthorized to cancel this order" });
+        }
+
+        // Only allow cancellation if order is Pending or Processing
+        if (order.status !== "Pending" && order.status !== "Processing") {
+          return res.status(400).json({
+            message: `Cannot cancel order with status: ${order.status}`,
+          });
+        }
+
+        const result = await ordersCollection.updateOne(
+          { _id: new ObjectId(req.params.id) },
+          { $set: { status: "Cancelled", updatedAt: new Date() } },
+        );
+
+        res.json({ message: "Order cancelled successfully" });
+      } catch (error) {
+        res.status(500).json({
+          message: "Error cancelling order",
+          error: error.message,
+        });
+      }
+    });
+
+    // ===================== RATINGS ROUTES =====================
+
+    // Submit a rating for a product
+    app.post("/api/ratings", async (req, res) => {
+      try {
+        const { productId, buyerEmail, orderId, rating, review } = req.body;
+
+        // Validate rating
+        if (!rating || rating < 1 || rating > 5) {
+          return res.status(400).json({
+            message: "Rating must be between 1 and 5",
+          });
+        }
+
+        // Check if order exists and is delivered
+        const order = await ordersCollection.findOne({
+          _id: new ObjectId(orderId),
+        });
+
+        if (!order) {
+          return res.status(404).json({ message: "Order not found" });
+        }
+
+        if (order.buyerEmail !== buyerEmail) {
+          return res
+            .status(403)
+            .json({ message: "Unauthorized to rate this product" });
+        }
+
+        if (order.status !== "Delivered") {
+          return res.status(400).json({
+            message: "You can only rate products from delivered orders",
+          });
+        }
+
+        // Check if already rated
+        const existingRating = await ratingsCollection.findOne({
+          productId,
+          buyerEmail,
+          orderId,
+        });
+
+        if (existingRating) {
+          // Update existing rating
+          await ratingsCollection.updateOne(
+            { _id: existingRating._id },
+            {
+              $set: {
+                rating,
+                review,
+                updatedAt: new Date(),
+              },
+            },
+          );
+        } else {
+          // Create new rating
+          const ratingData = {
+            productId,
+            buyerEmail,
+            orderId,
+            rating,
+            review: review || "",
+            createdAt: new Date(),
+          };
+          await ratingsCollection.insertOne(ratingData);
+        }
+
+        // Calculate and update average rating for the product
+        const allRatings = await ratingsCollection
+          .find({ productId })
+          .toArray();
+        const averageRating =
+          allRatings.reduce((sum, r) => sum + r.rating, 0) / allRatings.length;
+        const roundedRating = Math.round(averageRating * 10) / 10;
+
+        console.log(
+          `Updating product ${productId} with rating: ${roundedRating}, total: ${allRatings.length}`,
+        );
+
+        await productsCollection.updateOne(
+          { _id: new ObjectId(productId) },
+          {
+            $set: {
+              rating: roundedRating,
+              totalRatings: allRatings.length,
+            },
+          },
+        );
+
+        res.json({
+          message: existingRating
+            ? "Rating updated successfully"
+            : "Rating submitted successfully",
+          averageRating: roundedRating,
+          totalRatings: allRatings.length,
+        });
+      } catch (error) {
+        res.status(500).json({
+          message: "Error submitting rating",
+          error: error.message,
+        });
+      }
+    });
+
+    // Get ratings for a product
+    app.get("/api/ratings/:productId", async (req, res) => {
+      try {
+        const ratings = await ratingsCollection
+          .find({ productId: req.params.productId })
+          .sort({ createdAt: -1 })
+          .toArray();
+        res.json(ratings);
+      } catch (error) {
+        res.status(500).json({
+          message: "Error fetching ratings",
+          error: error.message,
+        });
+      }
+    });
+
+    // Check if user has rated a product from a specific order
+    app.get("/api/ratings/check/:orderId/:productId", async (req, res) => {
+      try {
+        const { orderId, productId } = req.params;
+        const { buyerEmail } = req.query;
+
+        const rating = await ratingsCollection.findOne({
+          orderId,
+          productId,
+          buyerEmail,
+        });
+
+        res.json({ hasRated: !!rating, rating: rating || null });
+      } catch (error) {
+        res.status(500).json({
+          message: "Error checking rating",
           error: error.message,
         });
       }
