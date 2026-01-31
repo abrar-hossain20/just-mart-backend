@@ -162,8 +162,29 @@ async function run() {
           paymentStatus: "Pending",
         };
 
-        // Decrement stock for each product in the order
+        // Validate stock before creating order
         if (orderData.items && orderData.items.length > 0) {
+          for (const item of orderData.items) {
+            const product = await productsCollection.findOne({
+              _id: new ObjectId(item.productId),
+            });
+
+            if (!product) {
+              return res.status(404).json({
+                message: `Product ${item.title} not found`,
+              });
+            }
+
+            if (product.stock !== undefined && product.stock < item.quantity) {
+              return res.status(400).json({
+                message: `Insufficient stock for ${item.title}. Available: ${product.stock}, Requested: ${item.quantity}`,
+                productId: item.productId,
+                availableStock: product.stock,
+              });
+            }
+          }
+
+          // Decrement stock for each product in the order
           for (const item of orderData.items) {
             await productsCollection.updateOne(
               { _id: new ObjectId(item.productId) },
@@ -227,23 +248,40 @@ async function run() {
           return res.status(404).json({ message: "Order not found" });
         }
 
-        // Check if user is the buyer
-        if (order.buyerEmail !== userEmail) {
+        // Check if user is the buyer (check both buyerEmail and userEmail for compatibility)
+        const orderBuyerEmail = order.buyerEmail || order.userEmail;
+        if (orderBuyerEmail !== userEmail) {
           return res
             .status(403)
             .json({ message: "Unauthorized to cancel this order" });
         }
 
-        // Only allow cancellation if order is Pending or Processing
-        if (order.status !== "Pending" && order.status !== "Processing") {
+        // Only allow cancellation if order is not Shipped or Delivered
+        if (order.status === "Shipped" || order.status === "Delivered") {
           return res.status(400).json({
-            message: `Cannot cancel order with status: ${order.status}`,
+            message: "Cannot cancel orders that have been shipped or delivered",
           });
+        }
+
+        // Restore stock for Pending or Processing orders
+        if (order.status === "Pending" || order.status === "Processing") {
+          for (const item of order.items) {
+            await productsCollection.updateOne(
+              { _id: new ObjectId(item.productId) },
+              { $inc: { stock: item.quantity } },
+            );
+          }
         }
 
         const result = await ordersCollection.updateOne(
           { _id: new ObjectId(req.params.id) },
-          { $set: { status: "Cancelled", updatedAt: new Date() } },
+          {
+            $set: {
+              status: "Cancelled",
+              cancelledAt: new Date(),
+              updatedAt: new Date(),
+            },
+          },
         );
 
         res.json({ message: "Order cancelled successfully" });
@@ -832,63 +870,6 @@ async function run() {
           message: "Error updating order status",
           error: error.message,
         });
-      }
-    });
-
-    // Cancel order (buyer)
-    app.patch("/api/orders/:id/cancel", async (req, res) => {
-      try {
-        const { id } = req.params;
-        const { userEmail } = req.body;
-
-        // Get the order first
-        const order = await ordersCollection.findOne({ _id: new ObjectId(id) });
-        if (!order) {
-          return res.status(404).json({ message: "Order not found" });
-        }
-
-        // Check if the user is the buyer (check both userEmail and buyerEmail for compatibility)
-        const orderBuyerEmail = order.userEmail || order.buyerEmail;
-        if (orderBuyerEmail !== userEmail) {
-          return res
-            .status(403)
-            .json({ message: "Unauthorized to cancel this order" });
-        }
-
-        // Only allow cancellation if order is not Delivered
-        if (order.status === "Delivered") {
-          return res
-            .status(400)
-            .json({ message: "Cannot cancel delivered orders" });
-        }
-
-        // If order was Processing or Shipped, restore the stock
-        if (order.status === "Processing" || order.status === "Shipped") {
-          for (const item of order.items) {
-            await productsCollection.updateOne(
-              { _id: new ObjectId(item.productId) },
-              { $inc: { stock: item.quantity } },
-            );
-          }
-        }
-
-        // Update the order status to Cancelled
-        const result = await ordersCollection.updateOne(
-          { _id: new ObjectId(id) },
-          {
-            $set: {
-              status: "Cancelled",
-              cancelledAt: new Date(),
-              updatedAt: new Date(),
-            },
-          },
-        );
-
-        res.json({ message: "Order cancelled successfully" });
-      } catch (error) {
-        res
-          .status(500)
-          .json({ message: "Error cancelling order", error: error.message });
       }
     });
 
