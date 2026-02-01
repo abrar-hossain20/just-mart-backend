@@ -217,15 +217,42 @@ async function run() {
     // Update order status
     app.patch("/api/orders/:id/status", async (req, res) => {
       try {
-        const { status } = req.body;
-        const result = await ordersCollection.updateOne(
-          { _id: new ObjectId(req.params.id) },
-          { $set: { status, updatedAt: new Date() } },
-        );
+        const { status, cancellationReason } = req.body;
 
-        if (result.matchedCount === 0) {
+        // Get the current order to check its status
+        const order = await ordersCollection.findOne({
+          _id: new ObjectId(req.params.id),
+        });
+
+        if (!order) {
           return res.status(404).json({ message: "Order not found" });
         }
+
+        // If changing status to Cancelled, restore stock
+        if (status === "Cancelled" && order.status !== "Cancelled") {
+          if (order.status === "Pending" || order.status === "Processing") {
+            for (const item of order.items) {
+              await productsCollection.updateOne(
+                { _id: new ObjectId(item.productId) },
+                { $inc: { stock: item.quantity } },
+              );
+            }
+          }
+        }
+
+        // Prepare update object
+        const updateData = { status, updatedAt: new Date() };
+
+        // Add cancellation reason if status is Cancelled
+        if (status === "Cancelled" && cancellationReason) {
+          updateData.cancellationReason = cancellationReason;
+          updateData.cancelledAt = new Date();
+        }
+
+        const result = await ordersCollection.updateOne(
+          { _id: new ObjectId(req.params.id) },
+          { $set: updateData },
+        );
 
         res.json({ message: "Order status updated successfully" });
       } catch (error) {
