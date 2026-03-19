@@ -21,8 +21,21 @@ const port = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// Middleware to verify Firebase token for protected routes
+//============================== Admin Email Configuration =========================
+const normalizeEmail = (email = "") => String(email).trim().toLowerCase();
+const configuredAdminEmails = new Set(
+  (process.env.ADMIN_EMAILS || "")
+    .split(",")
+    .map((email) => normalizeEmail(email))
+    .filter(Boolean),
+);
 
+const getDefaultRoleForEmail = (email) => {
+  return configuredAdminEmails.has(normalizeEmail(email)) ? "admin" : "user";
+};
+//================================================================================
+
+// Middleware to verify Firebase token for protected routes
 //==============================verify token middleware========================
 const verifyFirebaseToken = async (req, res, next) => {
   if (!req.headers.authorization) {
@@ -34,7 +47,9 @@ const verifyFirebaseToken = async (req, res, next) => {
   }
   try {
     const userInfo = await admin.auth().verifyIdToken(token);
-    req.token_email = userInfo.email;
+    req.token_email = normalizeEmail(userInfo.email);
+    req.token_name = userInfo.name || "";
+    req.token_photo = userInfo.picture || "";
     console.log("after token validation: ", userInfo);
     next();
   } catch {
@@ -46,13 +61,13 @@ const verifyFirebaseToken = async (req, res, next) => {
 
 const verifyTokenEmail = (emailSource = "query", emailKey = "email") => {
   return (req, res, next) => {
-    const requestEmail = req[emailSource]?.[emailKey];
+    const requestEmail = normalizeEmail(req[emailSource]?.[emailKey]);
 
     if (!requestEmail) {
       return res.status(400).send({ message: "email is required" });
     }
 
-    if (requestEmail !== req.token_email) {
+    if (requestEmail !== normalizeEmail(req.token_email)) {
       return res.status(403).send({ message: "forbidden access" });
     }
 
@@ -84,6 +99,105 @@ async function run() {
     const wishlistsCollection = db.collection("wishlists");
     const ordersCollection = db.collection("orders");
     const ratingsCollection = db.collection("ratings");
+
+    const ensureUserRecord = async ({ email, name = "", photoURL = "" }) => {
+      const normalizedEmail = normalizeEmail(email);
+      if (!normalizedEmail) {
+        return null;
+      }
+
+      const defaultRole = getDefaultRoleForEmail(normalizedEmail);
+      const existingUser = await usersCollection.findOne({
+        email: normalizedEmail,
+      });
+
+      if (!existingUser) {
+        const newUser = {
+          email: normalizedEmail,
+          name: name || normalizedEmail.split("@")[0],
+          photoURL: photoURL || "",
+          role: defaultRole,
+          createdAt: new Date(),
+        };
+        await usersCollection.insertOne(newUser);
+        return newUser;
+      }
+
+      const updateData = {};
+
+      if (!existingUser.role) {
+        updateData.role = defaultRole;
+      } else if (defaultRole === "admin" && existingUser.role !== "admin") {
+        updateData.role = "admin";
+      }
+
+      if (name && !existingUser.name) {
+        updateData.name = name;
+      }
+
+      if (photoURL && !existingUser.photoURL) {
+        updateData.photoURL = photoURL;
+      }
+
+      if (Object.keys(updateData).length > 0) {
+        updateData.updatedAt = new Date();
+        await usersCollection.updateOne(
+          { email: normalizedEmail },
+          { $set: updateData },
+        );
+      }
+
+      return {
+        ...existingUser,
+        ...updateData,
+      };
+    };
+
+    const hasAdminAccess = async (email) => {
+      const normalizedEmail = normalizeEmail(email);
+
+      if (!normalizedEmail) {
+        return false;
+      }
+
+      if (configuredAdminEmails.has(normalizedEmail)) {
+        await usersCollection.updateOne(
+          { email: normalizedEmail },
+          {
+            $set: {
+              role: "admin",
+              updatedAt: new Date(),
+            },
+            $setOnInsert: {
+              email: normalizedEmail,
+              name: normalizedEmail.split("@")[0],
+              createdAt: new Date(),
+            },
+          },
+          { upsert: true },
+        );
+        return true;
+      }
+
+      const userDoc = await usersCollection.findOne({ email: normalizedEmail });
+      return userDoc?.role === "admin";
+    };
+
+    const verifyAdmin = async (req, res, next) => {
+      try {
+        const isAdmin = await hasAdminAccess(req.token_email);
+        if (!isAdmin) {
+          return res.status(403).json({ message: "Admin access required" });
+        }
+
+        next();
+      } catch (error) {
+        return res.status(500).json({
+          message: "Error verifying admin access",
+          error: error.message,
+        });
+      }
+    };
 
     // ===================== PRODUCTS ROUTES =====================
 
@@ -167,6 +281,54 @@ async function run() {
         res
           .status(500)
           .json({ message: "Error updating product", error: error.message });
+      }
+    });
+
+    // Delete product by ID (seller owner or admin)
+    app.delete("/api/products/:id", verifyFirebaseToken, async (req, res) => {
+      try {
+        const productId = req.params.id;
+
+        if (!ObjectId.isValid(productId)) {
+          return res.status(400).json({ message: "Invalid product id" });
+        }
+
+        const product = await productsCollection.findOne({
+          _id: new ObjectId(productId),
+        });
+
+        if (!product) {
+          return res.status(404).json({ message: "Product not found" });
+        }
+
+        const requesterEmail = normalizeEmail(req.token_email);
+        const isOwner = normalizeEmail(product.sellerEmail) === requesterEmail;
+        const isAdmin = await hasAdminAccess(requesterEmail);
+
+        if (!isOwner && !isAdmin) {
+          return res.status(403).json({
+            message: "You are not allowed to delete this product",
+          });
+        }
+
+        await productsCollection.deleteOne({ _id: new ObjectId(productId) });
+
+        await Promise.all([
+          cartsCollection.updateMany(
+            {},
+            { $pull: { items: { productId: String(productId) } } },
+          ),
+          wishlistsCollection.updateMany(
+            {},
+            { $pull: { items: { productId: String(productId) } } },
+          ),
+        ]);
+
+        res.json({ message: "Product deleted successfully" });
+      } catch (error) {
+        res
+          .status(500)
+          .json({ message: "Error deleting product", error: error.message });
       }
     });
 
@@ -290,14 +452,45 @@ async function run() {
       async (req, res) => {
         try {
           const { status, cancellationReason } = req.body;
+          const orderId = req.params.id;
+
+          if (!ObjectId.isValid(orderId)) {
+            return res.status(400).json({ message: "Invalid order id" });
+          }
+
+          const allowedStatuses = [
+            "Pending",
+            "Processing",
+            "Shipped",
+            "Delivered",
+            "Cancelled",
+          ];
+
+          if (!allowedStatuses.includes(status)) {
+            return res.status(400).json({
+              message: "Invalid order status",
+            });
+          }
 
           // Get the current order to check its status
           const order = await ordersCollection.findOne({
-            _id: new ObjectId(req.params.id),
+            _id: new ObjectId(orderId),
           });
 
           if (!order) {
             return res.status(404).json({ message: "Order not found" });
+          }
+
+          const requesterEmail = normalizeEmail(req.token_email);
+          const isAdmin = await hasAdminAccess(requesterEmail);
+          const isOrderSeller = order.items?.some(
+            (item) => normalizeEmail(item.sellerEmail) === requesterEmail,
+          );
+
+          if (!isAdmin && !isOrderSeller) {
+            return res.status(403).json({
+              message: "Unauthorized to update this order",
+            });
           }
 
           // If changing status to Cancelled, restore stock
@@ -321,8 +514,8 @@ async function run() {
             updateData.cancelledAt = new Date();
           }
 
-          const result = await ordersCollection.updateOne(
-            { _id: new ObjectId(req.params.id) },
+          await ordersCollection.updateOne(
+            { _id: new ObjectId(orderId) },
             { $set: updateData },
           );
 
@@ -344,6 +537,7 @@ async function run() {
       async (req, res) => {
         try {
           const { userEmail } = req.body;
+          const normalizedUserEmail = normalizeEmail(userEmail);
           const order = await ordersCollection.findOne({
             _id: new ObjectId(req.params.id),
           });
@@ -353,8 +547,10 @@ async function run() {
           }
 
           // Check if user is the buyer (check both buyerEmail and userEmail for compatibility)
-          const orderBuyerEmail = order.buyerEmail || order.userEmail;
-          if (orderBuyerEmail !== userEmail) {
+          const orderBuyerEmail = normalizeEmail(
+            order.buyerEmail || order.userEmail,
+          );
+          if (orderBuyerEmail !== normalizedUserEmail) {
             return res
               .status(403)
               .json({ message: "Unauthorized to cancel this order" });
@@ -378,7 +574,7 @@ async function run() {
             }
           }
 
-          const result = await ordersCollection.updateOne(
+          await ordersCollection.updateOne(
             { _id: new ObjectId(req.params.id) },
             {
               $set: {
@@ -582,41 +778,75 @@ async function run() {
     // ===================== USERS ROUTES =====================
 
     // Register/Create user
-    app.post("/api/users/register", async (req, res) => {
-      try {
-        const { email, name, photoURL } = req.body;
+    app.post(
+      "/api/users/register",
+      verifyFirebaseToken,
+      verifyTokenEmail("body"),
+      async (req, res) => {
+        try {
+          const { email, name, photoURL } = req.body;
+          const normalizedEmail = normalizeEmail(email);
 
-        const existingUser = await usersCollection.findOne({ email });
-        if (existingUser) {
-          return res.json({
-            message: "User already exists",
-            user: existingUser,
+          if (!normalizedEmail) {
+            return res.status(400).json({ message: "Email is required" });
+          }
+
+          const existingUser = await usersCollection.findOne({
+            email: normalizedEmail,
+          });
+          const userRecord = await ensureUserRecord({
+            email: normalizedEmail,
+            name,
+            photoURL,
+          });
+
+          res.status(existingUser ? 200 : 201).json({
+            message: existingUser
+              ? "User already exists"
+              : "User created successfully",
+            user: userRecord,
+          });
+        } catch (error) {
+          res
+            .status(500)
+            .json({ message: "Error creating user", error: error.message });
+        }
+      },
+    );
+
+    // Get authenticated user's role
+    app.get(
+      "/api/users/:email/role",
+      verifyFirebaseToken,
+      verifyTokenEmail("params"),
+      async (req, res) => {
+        try {
+          const email = normalizeEmail(req.params.email);
+          const userRecord = await ensureUserRecord({
+            email,
+            name: req.token_name,
+            photoURL: req.token_photo,
+          });
+
+          res.json({
+            email,
+            role: userRecord?.role || getDefaultRoleForEmail(email),
+            name: userRecord?.name || req.token_name || "",
+          });
+        } catch (error) {
+          res.status(500).json({
+            message: "Error fetching user role",
+            error: error.message,
           });
         }
-
-        const newUser = {
-          email,
-          name,
-          photoURL,
-          createdAt: new Date(),
-        };
-
-        const result = await usersCollection.insertOne(newUser);
-        res.status(201).json({
-          message: "User created successfully",
-          userId: result.insertedId,
-        });
-      } catch (error) {
-        res
-          .status(500)
-          .json({ message: "Error creating user", error: error.message });
-      }
-    });
+      },
+    );
 
     // Get user by email
     app.get("/api/users/:email", async (req, res) => {
       try {
-        const user = await usersCollection.findOne({ email: req.params.email });
+        const email = normalizeEmail(req.params.email);
+        const user = await usersCollection.findOne({ email });
         if (!user) {
           return res.status(404).json({ message: "User not found" });
         }
@@ -637,12 +867,16 @@ async function run() {
       verifyTokenEmail("params"),
       async (req, res) => {
         try {
-          let user = await usersCollection.findOne({ email: req.params.email });
+          const email = normalizeEmail(req.params.email);
+          let user = await usersCollection.findOne({ email });
 
           // If user doesn't exist, create them with default profile
           if (!user) {
             const newUser = {
-              email: req.params.email,
+              email,
+              name: req.token_name || email.split("@")[0],
+              photoURL: req.token_photo || "",
+              role: getDefaultRoleForEmail(email),
               profile: {
                 buyingContactNumber: "",
                 sellingContactNumber: "",
@@ -683,9 +917,10 @@ async function run() {
       async (req, res) => {
         try {
           const { profile } = req.body;
+          const email = normalizeEmail(req.params.email);
 
-          const result = await usersCollection.updateOne(
-            { email: req.params.email },
+          await usersCollection.updateOne(
+            { email },
             {
               $set: {
                 profile: {
@@ -700,7 +935,10 @@ async function run() {
                 updatedAt: new Date(),
               },
               $setOnInsert: {
-                email: req.params.email,
+                email,
+                role: getDefaultRoleForEmail(email),
+                name: req.token_name || email.split("@")[0],
+                photoURL: req.token_photo || "",
                 createdAt: new Date(),
               },
             },
@@ -809,12 +1047,10 @@ async function run() {
 
           res.json({ message: "Item removed from cart successfully" });
         } catch (error) {
-          res
-            .status(500)
-            .json({
-              message: "Error removing from cart",
-              error: error.message,
-            });
+          res.status(500).json({
+            message: "Error removing from cart",
+            error: error.message,
+          });
         }
       },
     );
@@ -918,12 +1154,10 @@ async function run() {
 
           res.json({ message: "Item added to wishlist successfully" });
         } catch (error) {
-          res
-            .status(500)
-            .json({
-              message: "Error adding to wishlist",
-              error: error.message,
-            });
+          res.status(500).json({
+            message: "Error adding to wishlist",
+            error: error.message,
+          });
         }
       },
     );
@@ -946,6 +1180,285 @@ async function run() {
         } catch (error) {
           res.status(500).json({
             message: "Error removing from wishlist",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // ===================== ADMIN ROUTES =====================
+
+    // Admin dashboard stats
+    app.get(
+      "/api/admin/stats",
+      verifyFirebaseToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const [totalProducts, totalUsers, totalOrders, totalAdmins] =
+            await Promise.all([
+              productsCollection.countDocuments(),
+              usersCollection.countDocuments(),
+              ordersCollection.countDocuments(),
+              usersCollection.countDocuments({ role: "admin" }),
+            ]);
+
+          const pendingOrders = await ordersCollection.countDocuments({
+            status: "Pending",
+          });
+
+          res.json({
+            totalProducts,
+            totalUsers,
+            totalOrders,
+            totalAdmins,
+            pendingOrders,
+          });
+        } catch (error) {
+          res.status(500).json({
+            message: "Error fetching admin stats",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // Admin - get all users
+    app.get(
+      "/api/admin/users",
+      verifyFirebaseToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const users = await usersCollection
+            .find(
+              {},
+              {
+                projection: {
+                  password: 0,
+                },
+              },
+            )
+            .sort({ createdAt: -1 })
+            .toArray();
+
+          res.json(users);
+        } catch (error) {
+          res.status(500).json({
+            message: "Error fetching users",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // Admin - update user role
+    app.patch(
+      "/api/admin/users/:id/role",
+      verifyFirebaseToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          const { role } = req.body;
+
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ message: "Invalid user id" });
+          }
+
+          if (!["user", "admin"].includes(role)) {
+            return res.status(400).json({
+              message: "Invalid role. Allowed values: user, admin",
+            });
+          }
+
+          const targetUser = await usersCollection.findOne({
+            _id: new ObjectId(id),
+          });
+
+          if (!targetUser) {
+            return res.status(404).json({ message: "User not found" });
+          }
+
+          if (
+            normalizeEmail(targetUser.email) === normalizeEmail(req.token_email)
+          ) {
+            return res.status(400).json({
+              message: "You cannot change your own role",
+            });
+          }
+
+          await usersCollection.updateOne(
+            { _id: new ObjectId(id) },
+            {
+              $set: {
+                role,
+                updatedAt: new Date(),
+              },
+            },
+          );
+
+          res.json({ message: "User role updated successfully" });
+        } catch (error) {
+          res.status(500).json({
+            message: "Error updating user role",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // Admin - get all products
+    app.get(
+      "/api/admin/products",
+      verifyFirebaseToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const products = await productsCollection
+            .find({})
+            .sort({ datePosted: -1 })
+            .toArray();
+          res.json(products);
+        } catch (error) {
+          res.status(500).json({
+            message: "Error fetching products",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // Admin - get all orders
+    app.get(
+      "/api/admin/orders",
+      verifyFirebaseToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const orders = await ordersCollection
+            .find({})
+            .sort({ orderDate: -1 })
+            .toArray();
+
+          res.json(orders);
+        } catch (error) {
+          res.status(500).json({
+            message: "Error fetching orders",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // Admin - update any order status
+    app.patch(
+      "/api/admin/orders/:id/status",
+      verifyFirebaseToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          const { status, cancellationReason } = req.body;
+
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ message: "Invalid order id" });
+          }
+
+          const allowedStatuses = [
+            "Pending",
+            "Processing",
+            "Shipped",
+            "Delivered",
+            "Cancelled",
+          ];
+
+          if (!allowedStatuses.includes(status)) {
+            return res.status(400).json({ message: "Invalid order status" });
+          }
+
+          const order = await ordersCollection.findOne({
+            _id: new ObjectId(id),
+          });
+
+          if (!order) {
+            return res.status(404).json({ message: "Order not found" });
+          }
+
+          if (status === "Cancelled" && order.status !== "Cancelled") {
+            if (order.status === "Pending" || order.status === "Processing") {
+              for (const item of order.items) {
+                await productsCollection.updateOne(
+                  { _id: new ObjectId(item.productId) },
+                  { $inc: { stock: item.quantity } },
+                );
+              }
+            }
+          }
+
+          const updateData = {
+            status,
+            updatedAt: new Date(),
+          };
+
+          if (status === "Cancelled") {
+            updateData.cancelledAt = new Date();
+            if (cancellationReason) {
+              updateData.cancellationReason = cancellationReason;
+            }
+          }
+
+          await ordersCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: updateData },
+          );
+
+          res.json({ message: "Order status updated successfully" });
+        } catch (error) {
+          res.status(500).json({
+            message: "Error updating order status",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // Admin - delete any product
+    app.delete(
+      "/api/admin/products/:id",
+      verifyFirebaseToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ message: "Invalid product id" });
+          }
+
+          const product = await productsCollection.findOne({
+            _id: new ObjectId(id),
+          });
+          if (!product) {
+            return res.status(404).json({ message: "Product not found" });
+          }
+
+          await productsCollection.deleteOne({ _id: new ObjectId(id) });
+          await Promise.all([
+            cartsCollection.updateMany(
+              {},
+              { $pull: { items: { productId: String(id) } } },
+            ),
+            wishlistsCollection.updateMany(
+              {},
+              { $pull: { items: { productId: String(id) } } },
+            ),
+          ]);
+
+          res.json({ message: "Product deleted successfully" });
+        } catch (error) {
+          res.status(500).json({
+            message: "Error deleting product",
             error: error.message,
           });
         }
