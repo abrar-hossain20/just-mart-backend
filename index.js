@@ -231,35 +231,68 @@ async function run() {
     });
 
     // Create new product
-    app.post("/api/products", verifyFirebaseToken, async (req, res) => {
-      try {
-        const productData = {
-          ...req.body,
-          datePosted: new Date().toISOString(),
-          rating: 0,
-          totalRatings: 0,
-        };
+    app.post(
+      "/api/products",
+      verifyFirebaseToken,
+      verifyTokenEmail("body", "sellerEmail"),
+      async (req, res) => {
+        try {
+          const requesterEmail = normalizeEmail(req.token_email);
 
-        const result = await productsCollection.insertOne(productData);
-        res.status(201).json({
-          message: "Product created successfully",
-          productId: result.insertedId,
-        });
-      } catch (error) {
-        res
-          .status(500)
-          .json({ message: "Error creating product", error: error.message });
-      }
-    });
+          const productData = {
+            ...req.body,
+            sellerEmail: requesterEmail,
+            datePosted: new Date().toISOString(),
+            rating: 0,
+            totalRatings: 0,
+          };
+
+          const result = await productsCollection.insertOne(productData);
+          res.status(201).json({
+            message: "Product created successfully",
+            productId: result.insertedId,
+          });
+        } catch (error) {
+          res
+            .status(500)
+            .json({ message: "Error creating product", error: error.message });
+        }
+      },
+    );
 
     // Update product by ID
     app.put("/api/products/:id", verifyFirebaseToken, async (req, res) => {
       try {
         const productId = req.params.id;
+
+        if (!ObjectId.isValid(productId)) {
+          return res.status(400).json({ message: "Invalid product id" });
+        }
+
+        const existingProduct = await productsCollection.findOne({
+          _id: new ObjectId(productId),
+        });
+
+        if (!existingProduct) {
+          return res.status(404).json({ message: "Product not found" });
+        }
+
+        const requesterEmail = normalizeEmail(req.token_email);
+        const isOwner =
+          normalizeEmail(existingProduct.sellerEmail) === requesterEmail;
+        const isAdmin = await hasAdminAccess(requesterEmail);
+
+        if (!isOwner && !isAdmin) {
+          return res.status(403).json({
+            message: "You are not allowed to update this product",
+          });
+        }
+
         const updateData = { ...req.body };
 
         // Remove fields that shouldn't be updated
         delete updateData._id;
+        delete updateData.sellerEmail;
         delete updateData.datePosted;
         delete updateData.rating;
         delete updateData.totalRatings;
@@ -268,10 +301,6 @@ async function run() {
           { _id: new ObjectId(productId) },
           { $set: updateData },
         );
-
-        if (result.matchedCount === 0) {
-          return res.status(404).json({ message: "Product not found" });
-        }
 
         res.json({
           message: "Product updated successfully",
