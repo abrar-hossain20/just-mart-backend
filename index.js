@@ -183,6 +183,53 @@ async function run() {
       return userDoc?.role === "admin";
     };
 
+    // Supports multiple historical item shapes in orders.
+    // Some legacy orders store product reference as _id or id instead of productId.
+    const getOrderItemProductId = (item = {}) => {
+      return item.productId || item._id || item.id || null;
+    };
+
+    // Restores stock for all valid items of an order.
+    // Uses bulkWrite for efficiency and skips malformed items safely.
+    const restoreOrderStock = async (order = {}) => {
+      if (!Array.isArray(order.items) || order.items.length === 0) {
+        return;
+      }
+
+      const stockRestoreOperations = [];
+
+      for (const item of order.items) {
+        const rawProductId = getOrderItemProductId(item);
+        const quantity = Number(item?.quantity);
+
+        // Skip invalid records so one bad item doesn't break full restoration.
+        if (!rawProductId || !Number.isFinite(quantity) || quantity <= 0) {
+          continue;
+        }
+
+        const productId = String(rawProductId);
+        if (!ObjectId.isValid(productId)) {
+          continue;
+        }
+
+        stockRestoreOperations.push({
+          updateOne: {
+            filter: { _id: new ObjectId(productId) },
+            update: { $inc: { stock: quantity } },
+          },
+        });
+      }
+
+      if (stockRestoreOperations.length === 0) {
+        return;
+      }
+
+      // ordered:false allows independent updates even if one operation fails.
+      await productsCollection.bulkWrite(stockRestoreOperations, {
+        ordered: false,
+      });
+    };
+
     const verifyAdmin = async (req, res, next) => {
       try {
         const isAdmin = await hasAdminAccess(req.token_email);
@@ -482,6 +529,10 @@ async function run() {
         try {
           const { status, cancellationReason } = req.body;
           const orderId = req.params.id;
+          const normalizedCancellationReason =
+            typeof cancellationReason === "string"
+              ? cancellationReason.trim()
+              : "";
 
           if (!ObjectId.isValid(orderId)) {
             return res.status(400).json({ message: "Invalid order id" });
@@ -516,21 +567,58 @@ async function run() {
             (item) => normalizeEmail(item.sellerEmail) === requesterEmail,
           );
 
+          const sellerAllowedTransitions = {
+            Pending: ["Processing", "Shipped", "Delivered", "Cancelled"],
+            Processing: ["Shipped", "Delivered", "Cancelled"],
+            Shipped: ["Delivered"],
+            Delivered: [],
+            Cancelled: [],
+          };
+
           if (!isAdmin && !isOrderSeller) {
             return res.status(403).json({
               message: "Unauthorized to update this order",
             });
           }
 
-          // If changing status to Cancelled, restore stock
+          if (!isAdmin && status !== order.status) {
+            const allowedNextStatuses =
+              sellerAllowedTransitions[order.status] || [];
+
+            if (!allowedNextStatuses.includes(status)) {
+              return res.status(400).json({
+                message: `Invalid status transition from ${order.status} to ${status}`,
+              });
+            }
+          }
+
+          const cancelledBy = isAdmin ? "admin" : "seller";
+
+          if (
+            status === "Cancelled" &&
+            cancelledBy === "seller" &&
+            !normalizedCancellationReason
+          ) {
+            return res.status(400).json({
+              message: "Cancellation reason is required",
+            });
+          }
+
+          if (
+            status === "Cancelled" &&
+            cancelledBy === "seller" &&
+            (order.status === "Shipped" || order.status === "Delivered")
+          ) {
+            return res.status(400).json({
+              message:
+                "Seller cannot cancel orders that are shipped or delivered",
+            });
+          }
+
+          // Restore stock once when transitioning to Cancelled from stock-consuming states.
           if (status === "Cancelled" && order.status !== "Cancelled") {
             if (order.status === "Pending" || order.status === "Processing") {
-              for (const item of order.items) {
-                await productsCollection.updateOne(
-                  { _id: new ObjectId(item.productId) },
-                  { $inc: { stock: item.quantity } },
-                );
-              }
+              await restoreOrderStock(order);
             }
           }
 
@@ -538,9 +626,14 @@ async function run() {
           const updateData = { status, updatedAt: new Date() };
 
           // Add cancellation reason if status is Cancelled
-          if (status === "Cancelled" && cancellationReason) {
-            updateData.cancellationReason = cancellationReason;
+          if (status === "Cancelled") {
             updateData.cancelledAt = new Date();
+            updateData.cancelledBy = cancelledBy;
+            updateData.cancelledByEmail = requesterEmail;
+
+            if (normalizedCancellationReason) {
+              updateData.cancellationReason = normalizedCancellationReason;
+            }
           }
 
           await ordersCollection.updateOne(
@@ -565,10 +658,26 @@ async function run() {
       verifyTokenEmail("body", "userEmail"),
       async (req, res) => {
         try {
-          const { userEmail } = req.body;
+          const { userEmail, cancellationReason } = req.body;
+          const orderId = req.params.id;
           const normalizedUserEmail = normalizeEmail(userEmail);
+          const normalizedCancellationReason =
+            typeof cancellationReason === "string"
+              ? cancellationReason.trim()
+              : "";
+
+          if (!ObjectId.isValid(orderId)) {
+            return res.status(400).json({ message: "Invalid order id" });
+          }
+
+          if (!normalizedCancellationReason) {
+            return res.status(400).json({
+              message: "Cancellation reason is required",
+            });
+          }
+
           const order = await ordersCollection.findOne({
-            _id: new ObjectId(req.params.id),
+            _id: new ObjectId(orderId),
           });
 
           if (!order) {
@@ -593,21 +702,25 @@ async function run() {
             });
           }
 
-          // Restore stock for Pending or Processing orders
+          if (order.status === "Cancelled") {
+            return res.status(400).json({
+              message: "Order is already cancelled",
+            });
+          }
+
+          // Buyer cancellation should return stock only if stock was already deducted.
           if (order.status === "Pending" || order.status === "Processing") {
-            for (const item of order.items) {
-              await productsCollection.updateOne(
-                { _id: new ObjectId(item.productId) },
-                { $inc: { stock: item.quantity } },
-              );
-            }
+            await restoreOrderStock(order);
           }
 
           await ordersCollection.updateOne(
-            { _id: new ObjectId(req.params.id) },
+            { _id: new ObjectId(orderId) },
             {
               $set: {
                 status: "Cancelled",
+                cancellationReason: normalizedCancellationReason,
+                cancelledBy: "buyer",
+                cancelledByEmail: normalizedUserEmail,
                 cancelledAt: new Date(),
                 updatedAt: new Date(),
               },
@@ -1389,6 +1502,10 @@ async function run() {
         try {
           const { id } = req.params;
           const { status, cancellationReason } = req.body;
+          const normalizedCancellationReason =
+            typeof cancellationReason === "string"
+              ? cancellationReason.trim()
+              : "";
 
           if (!ObjectId.isValid(id)) {
             return res.status(400).json({ message: "Invalid order id" });
@@ -1416,12 +1533,8 @@ async function run() {
 
           if (status === "Cancelled" && order.status !== "Cancelled") {
             if (order.status === "Pending" || order.status === "Processing") {
-              for (const item of order.items) {
-                await productsCollection.updateOne(
-                  { _id: new ObjectId(item.productId) },
-                  { $inc: { stock: item.quantity } },
-                );
-              }
+              // Admin cancellation follows same restoration logic for consistency.
+              await restoreOrderStock(order);
             }
           }
 
@@ -1432,8 +1545,10 @@ async function run() {
 
           if (status === "Cancelled") {
             updateData.cancelledAt = new Date();
-            if (cancellationReason) {
-              updateData.cancellationReason = cancellationReason;
+            updateData.cancelledBy = "admin";
+            updateData.cancelledByEmail = normalizeEmail(req.token_email);
+            if (normalizedCancellationReason) {
+              updateData.cancellationReason = normalizedCancellationReason;
             }
           }
 
