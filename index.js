@@ -746,13 +746,51 @@ async function run() {
       verifyTokenEmail("body", "buyerEmail"),
       async (req, res) => {
         try {
-          const { productId, buyerEmail, orderId, rating, review } = req.body;
+          const {
+            productId,
+            buyerEmail,
+            orderId,
+            rating,
+            review,
+            sellerEmail,
+            sellerRating,
+          } = req.body;
+
+          const parsedRating = Number(rating);
+          const hasSellerRatingInput =
+            sellerRating !== undefined &&
+            sellerRating !== null &&
+            sellerRating !== "";
+          const parsedSellerRating = hasSellerRatingInput
+            ? Number(sellerRating)
+            : null;
+          const normalizedBuyerEmail = normalizeEmail(buyerEmail);
+          const normalizedSellerEmail = normalizeEmail(sellerEmail);
 
           // Validate rating
-          if (!rating || rating < 1 || rating > 5) {
+          if (
+            !Number.isFinite(parsedRating) ||
+            parsedRating < 1 ||
+            parsedRating > 5
+          ) {
             return res.status(400).json({
               message: "Rating must be between 1 and 5",
             });
+          }
+
+          if (
+            hasSellerRatingInput &&
+            (!Number.isFinite(parsedSellerRating) ||
+              parsedSellerRating < 1 ||
+              parsedSellerRating > 5)
+          ) {
+            return res.status(400).json({
+              message: "Seller rating must be between 1 and 5",
+            });
+          }
+
+          if (!ObjectId.isValid(orderId)) {
+            return res.status(400).json({ message: "Invalid order id" });
           }
 
           // Check if order exists and is delivered
@@ -764,7 +802,11 @@ async function run() {
             return res.status(404).json({ message: "Order not found" });
           }
 
-          if (order.buyerEmail !== buyerEmail) {
+          const orderBuyerEmail = normalizeEmail(
+            order.buyerEmail || order.userEmail,
+          );
+
+          if (orderBuyerEmail !== normalizedBuyerEmail) {
             return res
               .status(403)
               .json({ message: "Unauthorized to rate this product" });
@@ -776,33 +818,78 @@ async function run() {
             });
           }
 
+          const matchedOrderItem = (order.items || []).find((item) => {
+            const orderItemProductId = getOrderItemProductId(item);
+            return String(orderItemProductId || "") === String(productId || "");
+          });
+
+          if (!matchedOrderItem) {
+            return res.status(400).json({
+              message: "Product does not belong to this order",
+            });
+          }
+
+          const orderItemSellerEmail = normalizeEmail(
+            matchedOrderItem.sellerEmail,
+          );
+          if (
+            normalizedSellerEmail &&
+            orderItemSellerEmail &&
+            normalizedSellerEmail !== orderItemSellerEmail
+          ) {
+            return res.status(400).json({
+              message: "Seller does not match the ordered product",
+            });
+          }
+
+          const effectiveSellerEmail =
+            normalizedSellerEmail || orderItemSellerEmail;
+
+          if (hasSellerRatingInput && !effectiveSellerEmail) {
+            return res.status(400).json({
+              message: "Seller information is required for seller rating",
+            });
+          }
+
           // Check if already rated
           const existingRating = await ratingsCollection.findOne({
             productId,
-            buyerEmail,
+            buyerEmail: normalizedBuyerEmail,
             orderId,
           });
+
+          const ratingUpdateData = {
+            rating: parsedRating,
+            review: review || "",
+            updatedAt: new Date(),
+          };
+
+          if (effectiveSellerEmail) {
+            ratingUpdateData.sellerEmail = effectiveSellerEmail;
+          }
+
+          if (hasSellerRatingInput) {
+            ratingUpdateData.sellerRating = parsedSellerRating;
+          }
 
           if (existingRating) {
             // Update existing rating
             await ratingsCollection.updateOne(
               { _id: existingRating._id },
               {
-                $set: {
-                  rating,
-                  review,
-                  updatedAt: new Date(),
-                },
+                $set: ratingUpdateData,
               },
             );
           } else {
             // Create new rating
             const ratingData = {
               productId,
-              buyerEmail,
+              buyerEmail: normalizedBuyerEmail,
               orderId,
-              rating,
+              rating: parsedRating,
               review: review || "",
+              sellerEmail: effectiveSellerEmail || null,
+              sellerRating: hasSellerRatingInput ? parsedSellerRating : null,
               createdAt: new Date(),
             };
             await ratingsCollection.insertOne(ratingData);
@@ -812,9 +899,14 @@ async function run() {
           const allRatings = await ratingsCollection
             .find({ productId })
             .toArray();
+          const validProductRatings = allRatings.filter((item) =>
+            Number.isFinite(Number(item.rating)),
+          );
           const averageRating =
-            allRatings.reduce((sum, r) => sum + r.rating, 0) /
-            allRatings.length;
+            validProductRatings.reduce(
+              (sum, item) => sum + Number(item.rating),
+              0,
+            ) / validProductRatings.length;
           const roundedRating = Math.round(averageRating * 10) / 10;
 
           console.log(
@@ -826,17 +918,57 @@ async function run() {
             {
               $set: {
                 rating: roundedRating,
-                totalRatings: allRatings.length,
+                totalRatings: validProductRatings.length,
               },
             },
           );
+
+          let roundedSellerRating = null;
+          let totalSellerRatings = 0;
+
+          if (effectiveSellerEmail && hasSellerRatingInput) {
+            const sellerRatings = await ratingsCollection
+              .find({
+                sellerEmail: effectiveSellerEmail,
+                sellerRating: { $gte: 1, $lte: 5 },
+              })
+              .toArray();
+
+            totalSellerRatings = sellerRatings.length;
+            const sellerRatingAverage =
+              sellerRatings.reduce(
+                (sum, item) => sum + Number(item.sellerRating || 0),
+                0,
+              ) / totalSellerRatings;
+            roundedSellerRating = Math.round(sellerRatingAverage * 10) / 10;
+
+            await usersCollection.updateOne(
+              { email: effectiveSellerEmail },
+              {
+                $set: {
+                  sellerRating: roundedSellerRating,
+                  totalSellerRatings,
+                  updatedAt: new Date(),
+                },
+                $setOnInsert: {
+                  email: effectiveSellerEmail,
+                  role: getDefaultRoleForEmail(effectiveSellerEmail),
+                  name: effectiveSellerEmail.split("@")[0],
+                  createdAt: new Date(),
+                },
+              },
+              { upsert: true },
+            );
+          }
 
           res.json({
             message: existingRating
               ? "Rating updated successfully"
               : "Rating submitted successfully",
             averageRating: roundedRating,
-            totalRatings: allRatings.length,
+            totalRatings: validProductRatings.length,
+            sellerAverageRating: roundedSellerRating,
+            totalSellerRatings,
           });
         } catch (error) {
           res.status(500).json({
@@ -1042,6 +1174,8 @@ async function run() {
                 customAddress: "",
               },
             },
+            sellerRating: user.sellerRating || 0,
+            totalSellerRatings: user.totalSellerRatings || 0,
           });
         } catch (error) {
           res
