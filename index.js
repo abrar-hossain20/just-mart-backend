@@ -260,6 +260,29 @@ async function run() {
       }
     });
 
+    // Get products by seller email
+    app.get("/api/products/seller/:email", async (req, res) => {
+      try {
+        const sellerEmail = normalizeEmail(req.params.email);
+
+        if (!sellerEmail) {
+          return res.status(400).json({ message: "Seller email is required" });
+        }
+
+        const products = await productsCollection
+          .find({ sellerEmail })
+          .sort({ datePosted: -1 })
+          .toArray();
+
+        res.json(products);
+      } catch (error) {
+        res.status(500).json({
+          message: "Error fetching seller products",
+          error: error.message,
+        });
+      }
+    });
+
     // Get single product by ID
     app.get("/api/products/:id", verifyFirebaseToken, async (req, res) => {
       try {
