@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+const SSLCommerzPayment = require('sslcommerz-lts')
 require("dotenv").config();
 
 // =================Firebase Admin SDK for token verification===================
@@ -86,6 +87,11 @@ const client = new MongoClient(uri, {
     deprecationErrors: true,
   },
 });
+
+// sslcommerz payment configuration
+const store_id = process.env.STORE_ID
+const store_passwd = process.env.STORE_PASSWORD
+const is_live = false //true for live, false for sandbox
 
 async function run() {
   try {
