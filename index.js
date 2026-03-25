@@ -21,6 +21,7 @@ const port = process.env.PORT || 5000;
 // Middleware
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 //============================== Admin Email Configuration =========================
 const normalizeEmail = (email = "") => String(email).trim().toLowerCase();
@@ -51,7 +52,6 @@ const verifyFirebaseToken = async (req, res, next) => {
     req.token_email = normalizeEmail(userInfo.email);
     req.token_name = userInfo.name || "";
     req.token_photo = userInfo.picture || "";
-    console.log("after token validation: ", userInfo);
     next();
   } catch {
     return res
@@ -495,6 +495,12 @@ async function run() {
             paymentMethod: req.body.paymentMethod || "cod",
           };
 
+          console.log("📋 Creating order for:", {
+            buyerEmail: orderData.buyerEmail,
+            paymentMethod: orderData.paymentMethod,
+            itemCount: orderData.items?.length || 0,
+          });
+
           // Validate stock before creating order
           if (orderData.items && orderData.items.length > 0) {
             for (const item of orderData.items) {
@@ -519,20 +525,39 @@ async function run() {
                 });
               }
             }
+          }
 
-            // Decrement stock for each product in the order
+          // Create order FIRST before any stock modifications
+          const result = await ordersCollection.insertOne(orderData);
+
+          // Only decrement stock for COD orders after successful order creation
+          // For online payment orders, stock will be decremented after payment verification
+          if (
+            orderData.paymentMethod === "cod" &&
+            orderData.items &&
+            orderData.items.length > 0
+          ) {
             for (const item of orderData.items) {
-              await productsCollection.updateOne(
+              const stockResult = await productsCollection.updateOne(
                 { _id: new ObjectId(item.productId) },
                 { $inc: { stock: -item.quantity } },
               );
+
+              if (stockResult.modifiedCount === 0) {
+                console.warn(
+                  `⚠️ Stock update failed for product ${item.productId} in order ${result.insertedId}`,
+                );
+              }
             }
+            console.log(
+              "📦 Stock decremented for COD order:",
+              result.insertedId,
+            );
           }
 
-          const result = await ordersCollection.insertOne(orderData);
-
-          // Clear buyer's cart after order
-          if (orderData.buyerEmail) {
+          // Clear buyer's cart only for COD orders
+          // For online payment, cart will be cleared after payment verification
+          if (orderData.buyerEmail && orderData.paymentMethod === "cod") {
             await cartsCollection.updateOne(
               { userEmail: orderData.buyerEmail },
               { $set: { items: [] } },
@@ -543,47 +568,329 @@ async function run() {
             message: "Order placed successfully",
             orderId: result.insertedId,
           });
-          const data = {
-            total_amount: 100,
-            currency: "BDT",
-            tran_id: "REF123", // use unique tran_id for each api call
-            success_url: "http://localhost:3030/success",
-            fail_url: "http://localhost:3030/fail",
-            cancel_url: "http://localhost:3030/cancel",
-            ipn_url: "http://localhost:3030/ipn",
-            shipping_method: "Courier",
-            product_name: "Computer.",
-            product_category: "Electronic",
-            product_profile: "general",
-            cus_name: "Customer Name",
-            cus_email: "customer@example.com",
-            cus_add1: "Dhaka",
-            cus_add2: "Dhaka",
-            cus_city: "Dhaka",
-            cus_state: "Dhaka",
-            cus_postcode: "1000",
-            cus_country: "Bangladesh",
-            cus_phone: "01711111111",
-            cus_fax: "01711111111",
-            ship_name: "Customer Name",
-            ship_add1: "Dhaka",
-            ship_add2: "Dhaka",
-            ship_city: "Dhaka",
-            ship_state: "Dhaka",
-            ship_postcode: 1000,
-            ship_country: "Bangladesh",
-          };
-          const sslcz = new SSLCommerzPayment(store_id, store_passwd, is_live);
-          sslcz.init(data).then((apiResponse) => {
-            // Redirect the user to payment gateway
-            let GatewayPageURL = apiResponse.GatewayPageURL;
-            res.redirect(GatewayPageURL);
-            console.log("Redirecting to: ", GatewayPageURL);
-          });
+          console.log("✅ Order created successfully:", result.insertedId);
         } catch (error) {
+          console.error("❌ Error creating order:", error.message);
           res
             .status(500)
             .json({ message: "Error creating order", error: error.message });
+        }
+      },
+    );
+
+    // Initiate payment with SSLCommerz
+    app.post(
+      "/api/orders/payment/initiate",
+      verifyFirebaseToken,
+      async (req, res) => {
+        try {
+          const {
+            orderId,
+            amount,
+            currency,
+            customerName,
+            customerEmail,
+            customerPhone,
+          } = req.body;
+
+          // Validate required fields
+          if (!orderId || !amount || !customerEmail || !customerPhone) {
+            return res.status(400).json({
+              message: "Missing required payment information",
+            });
+          }
+
+          // Fetch order to verify it exists
+          if (!ObjectId.isValid(orderId)) {
+            return res.status(400).json({ message: "Invalid order id" });
+          }
+
+          const order = await ordersCollection.findOne({
+            _id: new ObjectId(orderId),
+          });
+
+          if (!order) {
+            return res.status(404).json({ message: "Order not found" });
+          }
+
+          // Generate unique transaction ID
+          const uniqueTransactionId = `TXN-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+          // Prepare SSLCommerz payment data
+          const paymentData = {
+            total_amount: amount || 0,
+            currency: currency || "BDT",
+            tran_id: uniqueTransactionId,
+            success_url: `${process.env.BACKEND_URL || "http://localhost:5001"}/api/orders/payment/callback/success`,
+            fail_url: `${process.env.BACKEND_URL || "http://localhost:5001"}/api/orders/payment/callback/failed`,
+            cancel_url: `${process.env.BACKEND_URL || "http://localhost:5001"}/api/orders/payment/callback/cancelled`,
+            ipn_url: `${process.env.BACKEND_URL || "http://localhost:5001"}/api/orders/payment/ipn`,
+            shipping_method: "Courier",
+            product_name:
+              order.items?.map((item) => item.title).join(", ") || "Orders",
+            product_category: "General",
+            product_profile: "general",
+            cus_name: customerName || order.buyerName || "Customer",
+            cus_email: customerEmail || order.buyerEmail,
+            cus_add1:
+              order.deliveryLocation === "city"
+                ? order.deliveryCityArea
+                : "Campus",
+            cus_add2: "Delivery Address",
+            cus_city:
+              order.deliveryLocation === "city"
+                ? order.deliveryCityArea
+                : "Campus",
+            cus_state: "State",
+            cus_postcode: "1000",
+            cus_country: "Bangladesh",
+            cus_phone: customerPhone,
+            cus_fax: customerPhone,
+            ship_name: customerName || order.buyerName || "Customer",
+            ship_add1:
+              order.deliveryLocation === "city"
+                ? order.deliveryCityArea
+                : "Campus",
+            ship_add2: "Delivery Address",
+            ship_city:
+              order.deliveryLocation === "city"
+                ? order.deliveryCityArea
+                : "Campus",
+            ship_state: "State",
+            ship_postcode: "1000",
+            ship_country: "Bangladesh",
+          };
+
+          // Update order with transaction ID
+          await ordersCollection.updateOne(
+            { _id: new ObjectId(orderId) },
+            {
+              $set: {
+                transactionId: uniqueTransactionId,
+                paymentInitiatedAt: new Date(),
+              },
+            },
+          );
+
+          // Initialize SSLCommerz payment
+          const sslcz = new SSLCommerzPayment(
+            process.env.STORE_ID,
+            process.env.STORE_PASSWORD,
+            false, // false for sandbox, true for live
+          );
+
+          sslcz
+            .init(paymentData)
+            .then((apiResponse) => {
+              console.log("✅ SSLCommerz Payment Initiated:", {
+                transactionId: uniqueTransactionId,
+                orderId: orderId,
+                amount: amount,
+                gatewayUrl: apiResponse.GatewayPageURL,
+              });
+
+              res.json({
+                success: true,
+                message: "Payment gateway initialized",
+                paymentUrl: apiResponse.GatewayPageURL,
+                transactionId: uniqueTransactionId,
+              });
+            })
+            .catch((error) => {
+              console.error("❌ SSLCommerz Error:", error);
+              res.status(500).json({
+                success: false,
+                message: "Failed to initialize payment",
+                error: error.message,
+              });
+            });
+        } catch (error) {
+          console.error("Error initiating payment:", error);
+          res.status(500).json({
+            message: "Error initiating payment",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // SSLCommerz callback handlers - redirect to frontend with params
+    const redirectToFrontendPaymentCallback = (req, res, callbackStatus) => {
+      const frontendBaseUrl =
+        process.env.FRONTEND_URL || "http://localhost:5173";
+      const queryParams = new URLSearchParams({
+        status: callbackStatus,
+        tran_id: req.body?.tran_id || "",
+        amount: req.body?.amount || "",
+        currency: req.body?.currency || "BDT",
+        val_id: req.body?.val_id || "",
+      });
+
+      const redirectUrl = `${frontendBaseUrl}/payment-callback?${queryParams.toString()}`;
+
+      console.log("🔁 Payment callback redirect:", {
+        callbackStatus,
+        tran_id: req.body?.tran_id,
+        redirectUrl,
+      });
+
+      res.redirect(302, redirectUrl);
+    };
+
+    app.post("/api/orders/payment/callback/success", (req, res) => {
+      redirectToFrontendPaymentCallback(req, res, "success");
+    });
+
+    app.post("/api/orders/payment/callback/failed", (req, res) => {
+      redirectToFrontendPaymentCallback(req, res, "failed");
+    });
+
+    app.post("/api/orders/payment/callback/cancelled", (req, res) => {
+      redirectToFrontendPaymentCallback(req, res, "cancelled");
+    });
+
+    app.post("/api/orders/payment/ipn", async (req, res) => {
+      console.log("📩 Payment IPN received:", {
+        tran_id: req.body?.tran_id,
+        status: req.body?.status,
+      });
+
+      res.status(200).json({ received: true });
+    });
+
+    // Verify payment callback from SSLCommerz
+    app.post(
+      "/api/orders/payment/verify",
+      verifyFirebaseToken,
+      async (req, res) => {
+        try {
+          const { transactionId, status, amount } = req.body;
+
+          if (!transactionId) {
+            return res.status(400).json({
+              message: "Transaction ID is required",
+            });
+          }
+
+          // Find order by transaction ID
+          const order = await ordersCollection.findOne({
+            transactionId: transactionId,
+          });
+
+          if (!order) {
+            return res.status(404).json({
+              message: "Order not found",
+            });
+          }
+
+          // Verify payment status
+          if (status === "success" || status === "VALID") {
+            // Prevent duplicate stock deduction - idempotency check
+            if (
+              order.paymentStatus === "Completed" ||
+              order.stockDeducted === true
+            ) {
+              return res.json({
+                success: true,
+                message: "Payment already verified",
+                order,
+              });
+            }
+
+            // Decrement stock for online payment orders after successful payment
+            if (order.items && order.items.length > 0) {
+              for (const item of order.items) {
+                const quantityToDeduct = Number(item.quantity) || 0;
+                if (quantityToDeduct <= 0) {
+                  return res.status(400).json({
+                    success: false,
+                    message: `Invalid quantity for ${item.title}`,
+                    productId: item.productId,
+                  });
+                }
+
+                const stockUpdateResult = await productsCollection.updateOne(
+                  {
+                    _id: new ObjectId(item.productId),
+                    stock: { $gte: quantityToDeduct },
+                  },
+                  { $inc: { stock: -quantityToDeduct } },
+                );
+
+                if (stockUpdateResult.modifiedCount === 0) {
+                  return res.status(409).json({
+                    success: false,
+                    message: `Stock update failed for ${item.title}. Payment will need manual review.`,
+                    productId: item.productId,
+                  });
+                }
+              }
+              console.log("📦 Stock decremented for order:", order._id);
+            }
+
+            // Update order payment status
+            await ordersCollection.updateOne(
+              { _id: order._id },
+              {
+                $set: {
+                  paymentStatus: "Completed",
+                  status: "Processing",
+                  paymentVerifiedAt: new Date(),
+                  stockDeducted: true,
+                },
+              },
+            );
+
+            // Clear buyer's cart after successful payment
+            if (order.buyerEmail) {
+              await cartsCollection.updateOne(
+                { userEmail: order.buyerEmail },
+                { $set: { items: [] } },
+              );
+              console.log("🛒 Cart cleared for:", order.buyerEmail);
+            }
+
+            console.log("✅ Payment Verified Successfully:", {
+              orderId: order._id,
+              transactionId: transactionId,
+              amount: amount,
+            });
+
+            res.json({
+              success: true,
+              message: "Payment verified successfully",
+              order: order,
+            });
+          } else {
+            // Update order with failed payment status
+            await ordersCollection.updateOne(
+              { _id: order._id },
+              {
+                $set: {
+                  paymentStatus: "Failed",
+                  paymentFailedAt: new Date(),
+                },
+              },
+            );
+
+            console.log("❌ Payment Failed:", {
+              orderId: order._id,
+              transactionId: transactionId,
+              status: status,
+            });
+
+            res.json({
+              success: false,
+              message: "Payment verification failed",
+              status: status,
+            });
+          }
+        } catch (error) {
+          console.error("Error verifying payment:", error);
+          res.status(500).json({
+            message: "Error verifying payment",
+            error: error.message,
+          });
         }
       },
     );
@@ -1335,6 +1642,19 @@ async function run() {
             return res.status(404).json({ message: "Product not found" });
           }
 
+          // Check stock availability
+          if (product.stock === undefined || product.stock <= 0) {
+            console.warn(
+              `⚠️ Out of stock rejection: "${product.title}" (stock: ${product.stock})`,
+            );
+            return res.status(400).json({
+              message: `Sorry, "${product.title}" is out of stock.`,
+              productId: productId,
+              availableStock: product.stock || 0,
+            });
+          }
+
+          // For existing items, check if we have enough stock for the additional quantity
           const cart = await cartsCollection.findOne({ userEmail: email });
 
           if (cart) {
@@ -1343,11 +1663,28 @@ async function run() {
             );
 
             if (existingItem) {
+              const newQuantity = existingItem.quantity + quantity;
+              if (newQuantity > product.stock) {
+                return res.status(400).json({
+                  message: `Cannot add more. Only ${product.stock} items available in stock.`,
+                  productId: productId,
+                  availableStock: product.stock,
+                });
+              }
+
               await cartsCollection.updateOne(
                 { userEmail: email, "items.productId": productId },
                 { $inc: { "items.$.quantity": quantity } },
               );
             } else {
+              if (quantity > product.stock) {
+                return res.status(400).json({
+                  message: `Cannot add more than ${product.stock} items. Only ${product.stock} available in stock.`,
+                  productId: productId,
+                  availableStock: product.stock,
+                });
+              }
+
               await cartsCollection.updateOne(
                 { userEmail: email },
                 {
@@ -1358,6 +1695,14 @@ async function run() {
               );
             }
           } else {
+            if (quantity > product.stock) {
+              return res.status(400).json({
+                message: `Cannot add more than ${product.stock} items. Only ${product.stock} available in stock.`,
+                productId: productId,
+                availableStock: product.stock,
+              });
+            }
+
             await cartsCollection.insertOne({
               userEmail: email,
               items: [{ productId, quantity, addedAt: new Date() }],
@@ -1366,7 +1711,13 @@ async function run() {
           }
 
           res.json({ message: "Item added to cart successfully" });
+          console.log(`✅ Item added to cart:`, { email, productId, quantity });
         } catch (error) {
+          console.error(`❌ Error adding to cart:`, {
+            email,
+            productId,
+            error: error.message,
+          });
           res
             .status(500)
             .json({ message: "Error adding to cart", error: error.message });
