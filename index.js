@@ -2,6 +2,8 @@ const express = require("express");
 const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const SSLCommerzPayment = require("sslcommerz-lts");
+const crypto = require("crypto");
+const nodemailer = require("nodemailer");
 require("dotenv").config();
 
 // =================Firebase Admin SDK for token verification===================
@@ -35,6 +37,42 @@ const configuredAdminEmails = new Set(
 const getDefaultRoleForEmail = (email) => {
   return configuredAdminEmails.has(normalizeEmail(email)) ? "admin" : "user";
 };
+
+const VALID_EDU_EMAIL_DOMAIN = "@student.just.edu.bd";
+const EMAIL_VERIFICATION_CODE_EXPIRY_MS = 10 * 60 * 1000;
+const SMTP_HOST =
+  process.env.EMAIL_HOST || process.env.SMTP_HOST || "smtp.gmail.com";
+const SMTP_PORT = Number(
+  process.env.EMAIL_PORT || process.env.SMTP_PORT || 587,
+);
+const SMTP_SECURE_ENV = process.env.EMAIL_SECURE || process.env.SMTP_SECURE;
+const SMTP_SECURE =
+  typeof SMTP_SECURE_ENV === "string"
+    ? SMTP_SECURE_ENV.toLowerCase() === "true"
+    : SMTP_PORT === 465;
+const SMTP_USER = process.env.EMAIL_USER || process.env.SMTP_USER || "";
+const SMTP_PASS_RAW =
+  process.env.EMAIL_PASS ||
+  process.env.EMAIL_PASSWORD ||
+  process.env.SMTP_PASS ||
+  process.env.SMTP_PASSWORD ||
+  "";
+const SMTP_PASS = /gmail/i.test(SMTP_HOST)
+  ? SMTP_PASS_RAW.replace(/\s+/g, "")
+  : SMTP_PASS_RAW;
+const EMAIL_TRANSPORT_CONFIGURED = Boolean(SMTP_USER && SMTP_PASS);
+
+const emailTransporter = EMAIL_TRANSPORT_CONFIGURED
+  ? nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: SMTP_PORT,
+      secure: SMTP_SECURE,
+      auth: {
+        user: SMTP_USER,
+        pass: SMTP_PASS,
+      },
+    })
+  : null;
 //================================================================================
 
 // Middleware to verify Firebase token for protected routes
@@ -194,6 +232,60 @@ async function run() {
       return userDoc?.role === "admin";
     };
 
+    const createDefaultProfile = () => ({
+      buyingContactNumber: "",
+      sellingContactNumber: "",
+      educationEmail: "",
+      educationEmailVerified: false,
+      address: {
+        locationType: "Inside Campus",
+        customAddress: "",
+      },
+    });
+
+    const generateVerificationCode = () => {
+      return String(Math.floor(100000 + Math.random() * 900000));
+    };
+
+    const hashVerificationCode = (code) => {
+      return crypto
+        .createHash("sha256")
+        .update(String(code || ""))
+        .digest("hex");
+    };
+
+    const sendEducationVerificationEmail = async (toEmail, code) => {
+      if (!emailTransporter) {
+        return {
+          sent: false,
+          reason: "email_transporter_not_configured",
+        };
+      }
+
+      const fromEmail =
+        process.env.EMAIL_FROM || SMTP_USER || "no-reply@just-emart.com";
+
+      await emailTransporter.sendMail({
+        from: fromEmail,
+        to: toEmail,
+        subject: "JUST EMART Educational Email Verification Code",
+        text: `Your JUST EMART verification code is ${code}. This code will expire in 10 minutes.`,
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 520px; margin: 0 auto;">
+            <h2 style="color: #0f766e;">Verify Your Educational Email</h2>
+            <p>Your JUST EMART verification code is:</p>
+            <div style="font-size: 28px; letter-spacing: 6px; font-weight: 700; color: #111827; margin: 16px 0;">${code}</div>
+            <p>This code will expire in 10 minutes.</p>
+            <p style="color: #6b7280; font-size: 13px;">If you did not request this, please ignore this email.</p>
+          </div>
+        `,
+      });
+
+      return {
+        sent: true,
+      };
+    };
+
     // Supports multiple historical item shapes in orders.
     // Some legacy orders store product reference as _id or id instead of productId.
     const getOrderItemProductId = (item = {}) => {
@@ -319,6 +411,25 @@ async function run() {
       async (req, res) => {
         try {
           const requesterEmail = normalizeEmail(req.token_email);
+
+          const sellerUser = await usersCollection.findOne({
+            email: requesterEmail,
+          });
+          const sellerProfile = sellerUser?.profile || {};
+          const sellerEducationEmail = normalizeEmail(
+            sellerProfile.educationEmail,
+          );
+          const isVerifiedStudentSeller =
+            sellerProfile.educationEmailVerified === true &&
+            sellerEducationEmail.endsWith(VALID_EDU_EMAIL_DOMAIN);
+
+          if (!isVerifiedStudentSeller) {
+            return res.status(403).json({
+              message:
+                "Educational email verification is required before selling items.",
+              code: "SELLER_EDU_EMAIL_NOT_VERIFIED",
+            });
+          }
 
           const productData = {
             ...req.body,
@@ -1530,14 +1641,7 @@ async function run() {
               name: req.token_name || email.split("@")[0],
               photoURL: req.token_photo || "",
               role: getDefaultRoleForEmail(email),
-              profile: {
-                buyingContactNumber: "",
-                sellingContactNumber: "",
-                address: {
-                  locationType: "Inside Campus",
-                  customAddress: "",
-                },
-              },
+              profile: createDefaultProfile(),
               createdAt: new Date(),
             };
             await usersCollection.insertOne(newUser);
@@ -1545,14 +1649,7 @@ async function run() {
           }
 
           res.json({
-            profile: user.profile || {
-              buyingContactNumber: "",
-              sellingContactNumber: "",
-              address: {
-                locationType: "Inside Campus",
-                customAddress: "",
-              },
-            },
+            profile: user.profile || createDefaultProfile(),
             sellerRating: user.sellerRating || 0,
             totalSellerRatings: user.totalSellerRatings || 0,
           });
@@ -1573,20 +1670,55 @@ async function run() {
         try {
           const { profile } = req.body;
           const email = normalizeEmail(req.params.email);
+          const existingUser = await usersCollection.findOne({ email });
+          const existingProfile =
+            existingUser?.profile || createDefaultProfile();
+
+          const submittedEducationEmail = normalizeEmail(
+            profile?.educationEmail || existingProfile.educationEmail || "",
+          );
+          const existingEducationEmail = normalizeEmail(
+            existingProfile.educationEmail,
+          );
+          const isSameEducationEmail =
+            submittedEducationEmail &&
+            existingEducationEmail &&
+            submittedEducationEmail === existingEducationEmail;
+
+          const nextProfile = {
+            buyingContactNumber: profile?.buyingContactNumber || "",
+            sellingContactNumber: profile?.sellingContactNumber || "",
+            educationEmail: submittedEducationEmail,
+            educationEmailVerified: isSameEducationEmail
+              ? Boolean(existingProfile.educationEmailVerified)
+              : false,
+            address: {
+              locationType: profile?.address?.locationType || "Inside Campus",
+              customAddress: profile?.address?.customAddress || "",
+            },
+          };
+
+          if (
+            isSameEducationEmail &&
+            existingProfile.educationEmailVerifiedAt
+          ) {
+            nextProfile.educationEmailVerifiedAt =
+              existingProfile.educationEmailVerifiedAt;
+          }
+
+          if (
+            isSameEducationEmail &&
+            existingProfile.educationEmailVerification
+          ) {
+            nextProfile.educationEmailVerification =
+              existingProfile.educationEmailVerification;
+          }
 
           await usersCollection.updateOne(
             { email },
             {
               $set: {
-                profile: {
-                  buyingContactNumber: profile.buyingContactNumber || "",
-                  sellingContactNumber: profile.sellingContactNumber || "",
-                  address: {
-                    locationType:
-                      profile.address?.locationType || "Inside Campus",
-                    customAddress: profile.address?.customAddress || "",
-                  },
-                },
+                profile: nextProfile,
                 updatedAt: new Date(),
               },
               $setOnInsert: {
@@ -1605,6 +1737,187 @@ async function run() {
           res
             .status(500)
             .json({ message: "Error updating profile", error: error.message });
+        }
+      },
+    );
+
+    app.post(
+      "/api/users/:email/education-email/send-code",
+      verifyFirebaseToken,
+      verifyTokenEmail("params"),
+      async (req, res) => {
+        try {
+          const accountEmail = normalizeEmail(req.params.email);
+          const educationEmail = normalizeEmail(req.body?.educationEmail);
+
+          if (!educationEmail) {
+            return res.status(400).json({
+              message: "Educational email is required",
+            });
+          }
+
+          if (!educationEmail.endsWith(VALID_EDU_EMAIL_DOMAIN)) {
+            return res.status(400).json({
+              message:
+                "Please use your university email address (e.g., your_roll.department@student.just.edu.bd)",
+            });
+          }
+
+          const verificationCode = generateVerificationCode();
+          const verificationPayload = {
+            codeHash: hashVerificationCode(verificationCode),
+            expiresAt: new Date(Date.now() + EMAIL_VERIFICATION_CODE_EXPIRY_MS),
+            requestedAt: new Date(),
+          };
+
+          await usersCollection.updateOne(
+            { email: accountEmail },
+            {
+              $set: {
+                "profile.educationEmail": educationEmail,
+                "profile.educationEmailVerified": false,
+                "profile.educationEmailVerification": verificationPayload,
+                updatedAt: new Date(),
+              },
+              $setOnInsert: {
+                email: accountEmail,
+                role: getDefaultRoleForEmail(accountEmail),
+                name: req.token_name || accountEmail.split("@")[0],
+                photoURL: req.token_photo || "",
+                createdAt: new Date(),
+              },
+            },
+            { upsert: true },
+          );
+
+          let emailDelivery = {
+            sent: false,
+            reason: "email_send_not_attempted",
+          };
+          try {
+            emailDelivery = await sendEducationVerificationEmail(
+              educationEmail,
+              verificationCode,
+            );
+          } catch (emailError) {
+            console.error("Failed to send education email code:", emailError);
+            emailDelivery = {
+              sent: false,
+              reason: emailError?.message || "email_send_failed",
+            };
+          }
+
+          if (!emailDelivery.sent && process.env.NODE_ENV === "production") {
+            return res.status(500).json({
+              message:
+                "Verification code could not be sent. Please try again later.",
+            });
+          }
+
+          const responsePayload = {
+            message: emailDelivery.sent
+              ? "Verification code sent to your educational email"
+              : "Verification email could not be delivered. Use devCode for local verification.",
+          };
+
+          if (!emailDelivery.sent && process.env.NODE_ENV !== "production") {
+            responsePayload.debugReason = emailDelivery.reason;
+          }
+
+          if (process.env.NODE_ENV !== "production") {
+            responsePayload.devCode = verificationCode;
+          }
+
+          res.json(responsePayload);
+        } catch (error) {
+          res.status(500).json({
+            message: "Error sending verification code",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    app.post(
+      "/api/users/:email/education-email/verify-code",
+      verifyFirebaseToken,
+      verifyTokenEmail("params"),
+      async (req, res) => {
+        try {
+          const accountEmail = normalizeEmail(req.params.email);
+          const educationEmail = normalizeEmail(req.body?.educationEmail);
+          const submittedCode = String(req.body?.code || "").trim();
+
+          if (!educationEmail || !submittedCode) {
+            return res.status(400).json({
+              message: "Educational email and verification code are required",
+            });
+          }
+
+          const userDoc = await usersCollection.findOne({
+            email: accountEmail,
+          });
+
+          if (!userDoc) {
+            return res.status(404).json({ message: "User not found" });
+          }
+
+          const profileData = userDoc.profile || {};
+          const storedEducationEmail = normalizeEmail(
+            profileData.educationEmail,
+          );
+          const verificationData = profileData.educationEmailVerification;
+
+          if (!verificationData?.codeHash || !verificationData?.expiresAt) {
+            return res.status(400).json({
+              message:
+                "No verification request found. Please request a new code.",
+            });
+          }
+
+          if (educationEmail !== storedEducationEmail) {
+            return res.status(400).json({
+              message:
+                "Educational email does not match the pending verification email.",
+            });
+          }
+
+          if (new Date(verificationData.expiresAt).getTime() < Date.now()) {
+            return res.status(400).json({
+              message: "Verification code expired. Please request a new code.",
+            });
+          }
+
+          const submittedCodeHash = hashVerificationCode(submittedCode);
+          if (submittedCodeHash !== verificationData.codeHash) {
+            return res.status(400).json({
+              message: "Invalid verification code",
+            });
+          }
+
+          await usersCollection.updateOne(
+            { email: accountEmail },
+            {
+              $set: {
+                "profile.educationEmail": educationEmail,
+                "profile.educationEmailVerified": true,
+                "profile.educationEmailVerifiedAt": new Date(),
+                updatedAt: new Date(),
+              },
+              $unset: {
+                "profile.educationEmailVerification": "",
+              },
+            },
+          );
+
+          res.json({
+            message: "Educational email verified successfully",
+          });
+        } catch (error) {
+          res.status(500).json({
+            message: "Error verifying educational email",
+            error: error.message,
+          });
         }
       },
     );
