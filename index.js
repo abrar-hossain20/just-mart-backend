@@ -77,7 +77,11 @@ const verifyTokenEmail = (emailSource = "query", emailKey = "email") => {
 };
 //========================================================================
 
-const uri = `mongodb+srv://${process.env.DB_USERNAME}:${process.env.DB_PASSWORD}@cluster0.4ofgl6a.mongodb.net/?appName=Cluster0`;
+const dbUsername = encodeURIComponent(process.env.DB_USERNAME || "");
+const dbPassword = encodeURIComponent(process.env.DB_PASSWORD || "");
+const uri =
+  process.env.MONGODB_URI ||
+  `mongodb+srv://${dbUsername}:${dbPassword}@cluster0.4ofgl6a.mongodb.net/?appName=Cluster0`;
 
 // Create a MongoClient
 const client = new MongoClient(uri, {
@@ -98,7 +102,8 @@ async function run() {
     await client.connect();
     console.log("✅ Successfully connected to MongoDB!");
 
-    const db = client.db("Final_Project");
+    const dbName = process.env.DB_NAME || "Final_Project";
+    const db = client.db(dbName);
     const productsCollection = db.collection("products");
     const usersCollection = db.collection("users");
     const cartsCollection = db.collection("carts");

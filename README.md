@@ -27,6 +27,9 @@ Create a `.env` file in the backend directory:
 PORT=5000
 DB_USERNAME=your_mongodb_username
 DB_PASSWORD=your_mongodb_password
+DB_NAME=Final_Project
+# Optional fallback (recommended if mongodb+srv DNS fails):
+# MONGODB_URI=mongodb://user:pass@host1:27017,host2:27017,host3:27017/?ssl=true&replicaSet=atlas-xxxx-shard-0&authSource=admin&retryWrites=true&w=majority
 ```
 
 ## Running the Server
