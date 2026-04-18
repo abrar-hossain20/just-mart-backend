@@ -21,11 +21,13 @@
   },
   "homepage": "https://github.com/abrar-hossain20/just-mart-backend#readme",
   "dependencies": {
+    "cloudinary": "^2.9.0",
     "cors": "^2.8.6",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
     "firebase-admin": "^13.7.0",
     "mongodb": "^7.0.0",
+    "multer": "^2.1.1",
     "nodemailer": "^6.10.1",
     "sslcommerz-lts": "^1.2.0"
   }

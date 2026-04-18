@@ -4,6 +4,8 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const SSLCommerzPayment = require("sslcommerz-lts");
 const crypto = require("crypto");
 const nodemailer = require("nodemailer");
+const multer = require("multer");
+const { v2: cloudinary } = require("cloudinary");
 require("dotenv").config();
 
 // =================Firebase Admin SDK for token verification===================
@@ -73,6 +75,41 @@ const emailTransporter = EMAIL_TRANSPORT_CONFIGURED
       },
     })
   : null;
+
+const MAX_IMAGE_UPLOAD_SIZE_BYTES = 5 * 1024 * 1024;
+const ALLOWED_IMAGE_MIME_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+]);
+const CLOUDINARY_CONFIGURED = Boolean(
+  process.env.CLOUDINARY_CLOUD_NAME &&
+  process.env.CLOUDINARY_API_KEY &&
+  process.env.CLOUDINARY_API_SECRET,
+);
+
+if (CLOUDINARY_CONFIGURED) {
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+  });
+}
+
+const imageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: MAX_IMAGE_UPLOAD_SIZE_BYTES,
+  },
+  fileFilter: (_req, file, cb) => {
+    if (ALLOWED_IMAGE_MIME_TYPES.has(file.mimetype)) {
+      cb(null, true);
+      return;
+    }
+
+    cb(new Error("Only JPG, PNG, and WEBP images are allowed"));
+  },
+});
 //================================================================================
 
 // Middleware to verify Firebase token for protected routes
@@ -348,6 +385,81 @@ async function run() {
         });
       }
     };
+
+    const uploadImageToCloudinary = (fileBuffer, folderPath) => {
+      return new Promise((resolve, reject) => {
+        const uploadStream = cloudinary.uploader.upload_stream(
+          {
+            folder: folderPath,
+            resource_type: "image",
+          },
+          (error, result) => {
+            if (error) {
+              reject(error);
+              return;
+            }
+
+            resolve(result);
+          },
+        );
+
+        uploadStream.end(fileBuffer);
+      });
+    };
+
+    app.post("/api/uploads/product-image", verifyFirebaseToken, (req, res) => {
+      imageUpload.single("image")(req, res, async (uploadError) => {
+        if (uploadError instanceof multer.MulterError) {
+          if (uploadError.code === "LIMIT_FILE_SIZE") {
+            return res.status(400).json({
+              message: "Image size must be 5MB or less",
+            });
+          }
+
+          return res.status(400).json({
+            message: uploadError.message || "Invalid image upload request",
+          });
+        }
+
+        if (uploadError) {
+          return res.status(400).json({
+            message: uploadError.message || "Image upload failed",
+          });
+        }
+
+        if (!CLOUDINARY_CONFIGURED) {
+          return res.status(500).json({
+            message: "Image upload service is not configured",
+          });
+        }
+
+        if (!req.file) {
+          return res.status(400).json({
+            message: "Image file is required",
+          });
+        }
+
+        try {
+          const requesterEmail = normalizeEmail(req.token_email || "unknown");
+          const safeEmailFolder = requesterEmail.replace(/[^a-z0-9._-]/g, "_");
+          const uploadResult = await uploadImageToCloudinary(
+            req.file.buffer,
+            `just-emart/products/${safeEmailFolder}`,
+          );
+
+          return res.status(201).json({
+            message: "Image uploaded successfully",
+            imageUrl: uploadResult.secure_url,
+            publicId: uploadResult.public_id,
+          });
+        } catch (error) {
+          return res.status(500).json({
+            message: "Failed to upload image",
+            error: error.message,
+          });
+        }
+      });
+    });
 
     // ===================== PRODUCTS ROUTES =====================
 
